@@ -29,7 +29,8 @@ log = logging.getLogger(__name__)
 
 # in-process caches
 _price_cache:   dict[str, tuple[pd.DataFrame, float]] = {}
-_info_cache:    dict[str, dict] = {}
+_info_cache:    dict[str, dict]  = {}
+_news_cache:    dict[str, list]  = {}
 _holders_cache: dict[str, list[str]] = {}
 
 
@@ -47,7 +48,7 @@ def _cache_key(tickers: list[str]) -> str:
 
 
 def _fetch_batch(batch: list[str], period: str) -> tuple[pd.DataFrame, list[str]]:
-    """Fetch one batch; one retry on failure. Returns (close_df, dropped)."""
+    """Fetch one batch with one retry. Returns (close_df, dropped_tickers)."""
     for attempt in range(2):
         try:
             raw = yf.download(
@@ -85,7 +86,7 @@ def fetch_prices(tickers: list[str]) -> pd.DataFrame:
             log.info("Cache hit (%d tickers)", len(df.columns))
             return df
 
-    period = f"{PRICE_HISTORY_DAYS}d"
+    period  = f"{PRICE_HISTORY_DAYS}d"
     batches = [all_tickers[i : i + BATCH_SIZE] for i in range(0, len(all_tickers), BATCH_SIZE)]
     frames: list[pd.DataFrame] = []
     all_dropped: list[str] = []
@@ -111,7 +112,7 @@ def fetch_prices(tickers: list[str]) -> pd.DataFrame:
     return result
 
 
-# ── info / holders helpers ────────────────────────────────────────────────────
+# ── per-ticker API helpers ────────────────────────────────────────────────────
 
 def _get_info(ticker: str) -> dict:
     if ticker not in _info_cache:
@@ -121,6 +122,15 @@ def _get_info(ticker: str) -> dict:
             log.warning("Could not fetch info for %s: %s", ticker, exc)
             _info_cache[ticker] = {}
     return _info_cache[ticker]
+
+
+def _get_news(ticker: str) -> list:
+    if ticker not in _news_cache:
+        try:
+            _news_cache[ticker] = yf.Ticker(ticker).news or []
+        except Exception:
+            _news_cache[ticker] = []
+    return _news_cache[ticker]
 
 
 def _get_holders(ticker: str) -> list[str]:
@@ -137,32 +147,29 @@ def _get_holders(ticker: str) -> list[str]:
     return _holders_cache[ticker]
 
 
-def _prefetch_info(tickers: list[str], workers: int = 20) -> None:
-    missing = [t for t in tickers if t not in _info_cache]
+def _prefetch(
+    fn: object,
+    tickers: list[str],
+    cache: dict,
+    label: str,
+    workers: int = 20,
+) -> None:
+    missing = [t for t in tickers if t not in cache]
     if not missing:
         return
-    log.info("Prefetching .info for %d tickers…", len(missing))
+    log.info("Prefetching %s for %d tickers…", label, len(missing))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_get_info, t): t for t in missing}
+        futures = {pool.submit(fn, t): t for t in missing}  # type: ignore[operator]
         done = 0
         for _ in as_completed(futures):
             done += 1
             if done % 100 == 0:
-                log.info("  info: %d/%d", done, len(missing))
+                log.info("  %s: %d/%d", label, done, len(missing))
 
 
-def _prefetch_holders(tickers: list[str], workers: int = 20) -> None:
-    missing = [t for t in tickers if t not in _holders_cache]
-    if not missing:
-        return
-    log.info("Prefetching institutional holders for %d tickers…", len(missing))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_get_holders, t): t for t in missing}
-        done = 0
-        for _ in as_completed(futures):
-            done += 1
-            if done % 100 == 0:
-                log.info("  holders: %d/%d", done, len(missing))
+def _prefetch_info(tickers: list[str])    -> None: _prefetch(_get_info,    tickers, _info_cache,    ".info")
+def _prefetch_news(tickers: list[str])    -> None: _prefetch(_get_news,    tickers, _news_cache,    "news")
+def _prefetch_holders(tickers: list[str]) -> None: _prefetch(_get_holders, tickers, _holders_cache, "holders")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -171,17 +178,16 @@ def _prefetch_holders(tickers: list[str], workers: int = 20) -> None:
 
 def _exp_weights(n: int, halflife: float) -> np.ndarray:
     """Normalized exponential weights; index n-1 (most recent) has highest weight."""
-    lam = 0.5 ** (1.0 / halflife)
-    # position 0 = oldest, n-1 = newest → lag from newest = n-1-i
-    lags = np.arange(n - 1, -1, -1)
-    w = lam ** lags
+    lam  = 0.5 ** (1.0 / halflife)
+    lags = np.arange(n - 1, -1, -1)   # n-1…0 from oldest to newest
+    w    = lam ** lags
     return w / w.sum()
 
 
 def _weighted_corr(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
     """Weighted Pearson correlation. w must already sum to 1."""
-    wx = np.dot(w, x)
-    wy = np.dot(w, y)
+    wx    = np.dot(w, x)
+    wy    = np.dot(w, y)
     cov   = np.dot(w, (x - wx) * (y - wy))
     std_x = np.sqrt(np.dot(w, (x - wx) ** 2))
     std_y = np.sqrt(np.dot(w, (y - wy) ** 2))
@@ -199,15 +205,15 @@ def _market_neutralize(rets: pd.DataFrame) -> pd.DataFrame:
     for col in rets.columns:
         if col == "SPY":
             continue
-        y = rets[col].values
+        y    = rets[col].values
         mask = np.isfinite(y) & np.isfinite(spy)
         if mask.sum() < 10:
             residuals[col] = pd.Series(np.full(len(y), np.nan), index=rets.index)
             continue
-        X = np.column_stack([spy[mask], np.ones(mask.sum())])
+        X      = np.column_stack([spy[mask], np.ones(mask.sum())])
         coeffs, _, _, _ = np.linalg.lstsq(X, y[mask], rcond=None)
         fitted = spy * coeffs[0] + coeffs[1]
-        resid = np.where(mask, y - fitted, np.nan)
+        resid  = np.where(mask, y - fitted, np.nan)
         residuals[col] = pd.Series(resid, index=rets.index)
     return pd.DataFrame(residuals)
 
@@ -216,19 +222,19 @@ def signal_correlation(
     user_ticker: str, candidates: list[str], prices: pd.DataFrame
 ) -> dict[str, float]:
     """
-    Score each candidate by exponentially-weighted residual correlation with user_ticker,
-    after market-neutralizing both series via OLS on SPY. Shrunk and mapped to [0,1].
+    Exponentially-weighted residual correlation, market-neutralized via OLS on SPY.
+    Shrunk and mapped to [0, 1].
     """
-    need = [t for t in [user_ticker] + candidates + ["SPY"] if t in prices.columns]
-    rets = prices[need].pct_change(fill_method=None).dropna(how="all")
+    need     = [t for t in [user_ticker] + candidates + ["SPY"] if t in prices.columns]
+    rets     = prices[need].pct_change(fill_method=None).dropna(how="all")
     residuals = _market_neutralize(rets)
     windowed  = residuals.iloc[-CORR_WINDOW:]
 
     if user_ticker not in windowed.columns:
         return {c: 0.5 for c in candidates}
 
-    user_r    = windowed[user_ticker].values
-    base_w    = _exp_weights(len(user_r), CORR_HALFLIFE)
+    user_r = windowed[user_ticker].values
+    base_w = _exp_weights(len(user_r), CORR_HALFLIFE)
 
     scores: dict[str, float] = {}
     for cand in candidates:
@@ -242,14 +248,13 @@ def signal_correlation(
             scores[cand] = 0.5
             continue
         w    = base_w[mask]
-        w    = w / w.sum()          # renormalize after dropping NaN positions
+        w    = w / w.sum()
         corr = _weighted_corr(user_r[mask], cand_r[mask], w)
-        corr_shrunk = corr * n / (n + SHRINK_K)
-        scores[cand] = (corr_shrunk + 1) / 2
+        scores[cand] = (corr * n / (n + SHRINK_K) + 1) / 2
     return scores
 
     # SIMPLE FALLBACK: Pearson correlation of daily returns over the full window.
-    # rets = prices[[user_ticker] + candidates].pct_change().dropna()
+    # rets = prices[[user_ticker] + candidates].pct_change(fill_method=None).dropna()
     # return {c: (rets[user_ticker].corr(rets[c]) + 1) / 2
     #         for c in candidates if c in rets.columns}
 
@@ -281,22 +286,17 @@ def signal_sector(user_ticker: str, candidates: list[str]) -> dict[str, float]:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _build_document(ticker: str) -> str:
-    """longBusinessSummary + recent headlines; degrades gracefully to ticker name."""
+    """longBusinessSummary + cached recent headlines. Degrades gracefully to ticker name."""
     info  = _get_info(ticker)
     parts = [info.get("longBusinessSummary", "")]
-    try:
-        news = yf.Ticker(ticker).news or []
-        for item in (news[:10] if isinstance(news, list) else []):
-            # yfinance ≥ 0.2.x nests title under content dict
-            title = (
-                item.get("title")
-                or (item.get("content") or {}).get("title")
-                or ""
-            )
-            if title:
-                parts.append(title)
-    except Exception:
-        pass
+    for item in (_get_news(ticker)[:10] if isinstance(_get_news(ticker), list) else []):
+        title = (
+            item.get("title")
+            or (item.get("content") or {}).get("title")
+            or ""
+        )
+        if title:
+            parts.append(title)
     doc = " ".join(p for p in parts if p).strip()
     return doc or ticker  # never empty
 
@@ -321,12 +321,10 @@ def signal_semantic(user_ticker: str, candidates: list[str]) -> dict[str, float]
     # counts: dict[str, int] = {}
     # for cand in candidates:
     #     cand_name = _get_info(cand).get("shortName", cand).lower()
-    #     try:
-    #         headlines = [n.get("title", "") for n in (yf.Ticker(user_ticker).news or [])]
-    #     except Exception:
-    #         headlines = []
     #     counts[cand] = sum(
-    #         1 for h in headlines if user_name in h.lower() and cand_name in h.lower()
+    #         1 for item in _get_news(user_ticker)
+    #         if user_name in (item.get("title","")).lower()
+    #         and cand_name in (item.get("title","")).lower()
     #     )
     # mx = max(counts.values(), default=1) or 1
     # return {c: v / mx for c, v in counts.items()}
@@ -338,13 +336,11 @@ def signal_semantic(user_ticker: str, candidates: list[str]) -> dict[str, float]
 
 def signal_fund_overlap(user_ticker: str, candidates: list[str]) -> dict[str, float]:
     """
-    Shared institutional holders, weighted by 1/log(ubiquity+2).
-    Ubiquity = how many stocks in {user} ∪ {candidates} share that holder.
+    Shared institutional holders weighted by 1/log(ubiquity+2).
+    Ubiquity = count of stocks in {user} ∪ {candidates} that share the holder.
     Down-weights Vanguard/BlackRock-type universal holders.
     """
-    all_tickers = [user_ticker] + candidates
-
-    # Count how many stocks in the working set each holder appears in
+    all_tickers  = [user_ticker] + candidates
     holder_count: dict[str, int] = {}
     for t in all_tickers:
         for h in _get_holders(t):
@@ -354,8 +350,7 @@ def signal_fund_overlap(user_ticker: str, candidates: list[str]) -> dict[str, fl
 
     scores: dict[str, float] = {}
     for cand in candidates:
-        cand_holders = set(_get_holders(cand))
-        shared       = user_holders & cand_holders
+        shared       = user_holders & set(_get_holders(cand))
         scores[cand] = sum(1.0 / math.log(holder_count[h] + 2) for h in shared)
     return scores
 
@@ -367,70 +362,157 @@ def signal_fund_overlap(user_ticker: str, candidates: list[str]) -> dict[str, fl
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Rank normalization + combined score
+# ════════════════════════════════════════════════════════════════════════════
+
+def rank_normalize(scores: dict[str, float]) -> dict[str, float]:
+    """Percentile rank each raw score independently; ties → average rank."""
+    return pd.Series(scores).rank(pct=True).to_dict()
+
+
+def _combined_score(
+    r_corr:   dict[str, float],
+    r_sector: dict[str, float],
+    r_news:   dict[str, float],
+    r_funds:  dict[str, float],
+) -> dict[str, float]:
+    return {
+        c: (0.45 * r_corr.get(c, 0.0)
+          + 0.15 * r_sector.get(c, 0.0)
+          + 0.20 * r_news.get(c, 0.0)
+          + 0.20 * r_funds.get(c, 0.0))
+        for c in r_corr
+    }
+
+
+def _ranking_key(
+    S:        dict[str, float],
+    r_corr:   dict[str, float],
+    r_sector: dict[str, float],
+    r_news:   dict[str, float],
+    r_funds:  dict[str, float],
+) -> dict[str, float]:
+    if USE_MAXPOOL:
+        return {c: 0.7 * S[c] + 0.3 * max(r_corr[c], r_sector[c], r_news[c], r_funds[c]) for c in S}
+    else:
+        return S
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Output assembler — /graph contract
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_graph(
+    holdings: list[dict],   # [{ticker, shares, cost_basis}]
+    prices:   pd.DataFrame,
+    universe: list[str],
+) -> dict:
+    """
+    For each holding run all four signals, rank-normalize, compute combined score S,
+    take top 8 by ranking key. Assemble nodes / edges / portfolio dict.
+
+    Edge weight is always S (not the pooled key) so thickness reflects true signal blend.
+    """
+    holding_tickers = [h["ticker"] for h in holdings]
+    all_needed      = list(dict.fromkeys(holding_tickers + universe))
+
+    log.info("Prefetching .info, news, holders for %d tickers…", len(all_needed))
+    _prefetch_info(all_needed)
+    _prefetch_news(all_needed)
+    _prefetch_holders(all_needed)
+
+    nodes: dict[str, dict] = {}
+    edges: list[dict]      = []
+
+    for h in holdings:
+        ticker     = h["ticker"]
+        candidates = [t for t in universe if t != ticker]
+
+        # Raw signals
+        s1 = signal_correlation(ticker, candidates, prices)
+        s2 = signal_sector(ticker, candidates)
+        s3 = signal_semantic(ticker, candidates)
+        s4 = signal_fund_overlap(ticker, candidates)
+
+        # Percentile-rank each signal independently
+        r1 = rank_normalize(s1)
+        r2 = rank_normalize(s2)
+        r3 = rank_normalize(s3)
+        r4 = rank_normalize(s4)
+
+        S   = _combined_score(r1, r2, r3, r4)
+        key = _ranking_key(S, r1, r2, r3, r4)
+
+        top8 = sorted(key, key=key.__getitem__, reverse=True)[:8]
+
+        for cand in top8:
+            edges.append({"source": ticker, "target": cand, "weight": round(S[cand], 4)})
+            if cand not in nodes:
+                info = _get_info(cand)
+                nodes[cand] = {"ticker": cand, "name": info.get("shortName", cand)}
+
+        if ticker not in nodes:
+            info = _get_info(ticker)
+            nodes[ticker] = {"ticker": ticker, "name": info.get("shortName", ticker)}
+
+    # Portfolio positions
+    positions   = []
+    total_value = 0.0
+    total_pl    = 0.0
+    for h in holdings:
+        ticker        = h["ticker"]
+        shares        = h["shares"]
+        cost_basis    = h["cost_basis"]
+        current_price = float(prices[ticker].dropna().iloc[-1]) if ticker in prices.columns else 0.0
+        current_value = shares * current_price
+        pl            = shares * (current_price - cost_basis)
+        total_value  += current_value
+        total_pl     += pl
+        positions.append({
+            "ticker":        ticker,
+            "shares":        shares,
+            "cost_basis":    cost_basis,
+            "current_price": round(current_price, 2),
+            "current_value": round(current_value, 2),
+            "pl":            round(pl, 2),
+        })
+
+    return {
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "portfolio": {
+            "positions":   positions,
+            "total_value": round(total_value, 2),
+            "total_pl":    round(total_pl, 2),
+        },
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ════════════════════════════════════════════════════════════════════════════
 
-def _top10(scores: dict[str, float]) -> list[tuple[str, float]]:
-    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:10]
-
-
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python engine.py TICKER          — run all four signals vs universe")
-        print("  python engine.py TICKER1 TICKER2 — fetch prices and print shape")
+        print("Usage: python engine.py TICKER [TICKER …]  — build /graph JSON for given holdings")
         sys.exit(1)
 
-    if len(sys.argv) == 2:
-        # ── Signal mode: single ticker vs full universe ───────────────────────
-        user     = sys.argv[1].upper()
-        universe = load_universe()
-        candidates = [t for t in universe if t != user]
+    tickers  = [t.upper() for t in sys.argv[1:]]
+    universe = load_universe()
 
-        print(f"\n{'='*62}")
-        print(f"  {user}  vs  {len(candidates)} universe candidates")
-        print(f"{'='*62}\n")
+    # Dummy holdings for CLI testing: 100 shares, cost_basis=0
+    holdings = [{"ticker": t, "shares": 100, "cost_basis": 0.0} for t in tickers]
 
-        # Signal 1 — needs prices for everyone
-        print("► Signal 1: fetching prices (universe + SPY)…")
-        prices = fetch_prices([user] + universe)
-        s1 = signal_correlation(user, candidates, prices)
-        print("\nSignal 1 — Residual Correlation  [0=anti, 0.5=neutral, 1=max]")
-        for ticker, score in _top10(s1):
-            print(f"  {ticker:<8}  {score:.4f}")
+    log.info("Fetching prices for %d universe tickers…", len(universe))
+    prices = fetch_prices(list(dict.fromkeys(tickers + universe)))
 
-        # Signals 2 & 3 share a .info prefetch
-        print("\n► Signals 2 & 3: prefetching .info…")
-        _prefetch_info([user] + candidates)
+    graph = build_graph(holdings, prices, universe)
+    print(json.dumps(graph, indent=2))
 
-        s2 = signal_sector(user, candidates)
-        print("\nSignal 2 — Sector / Industry  [0=none, 0.6=sector, 1.0=industry]")
-        for ticker, score in _top10(s2):
-            info = _get_info(ticker)
-            print(f"  {ticker:<8}  {score:.1f}  {info.get('industry', '?')}")
-
-        s3 = signal_semantic(user, candidates)
-        print("\nSignal 3 — Semantic / TF-IDF  [0=unrelated, 1=identical]")
-        for ticker, score in _top10(s3):
-            print(f"  {ticker:<8}  {score:.4f}")
-
-        # Signal 4 — needs institutional holders
-        print("\n► Signal 4: prefetching institutional holders…")
-        _prefetch_holders([user] + candidates)
-
-        s4 = signal_fund_overlap(user, candidates)
-        print("\nSignal 4 — Fund Overlap / Rarity-Weighted  [higher = more rare shared holders]")
-        for ticker, score in _top10(s4):
-            print(f"  {ticker:<8}  {score:.4f}")
-
-    else:
-        # ── Price-shape mode (backward compat) ───────────────────────────────
-        tickers = [t.upper() for t in sys.argv[1:]]
-        df = fetch_prices(tickers)
-        print(f"\nShape: {df.shape}")
-        print(f"Columns: {list(df.columns)}")
-        print(f"SPY present: {'SPY' in df.columns}")
-        dropped = [t for t in tickers if t not in df.columns]
-        if dropped:
-            print(f"Dropped: {dropped}")
-        print(df.tail(3))
+    n_nodes = len(graph["nodes"])
+    n_edges = len(graph["edges"])
+    weights = [e["weight"] for e in graph["edges"]]
+    log.info(
+        "Done — nodes: %d  edges: %d  weight range: [%.4f, %.4f]",
+        n_nodes, n_edges, min(weights, default=0), max(weights, default=0),
+    )
