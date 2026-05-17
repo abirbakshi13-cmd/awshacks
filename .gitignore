@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Cache
+*.cache
+cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets / bundles
+.env
+*.zip
+
+# sp500.json is a fetched-once committed artifact — never ignore it
+!bedrock/sp500.json
